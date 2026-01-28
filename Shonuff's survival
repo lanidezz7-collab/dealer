@@ -1,0 +1,2184 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Oxide.Core.Plugins;
+using UnityEngine;
+using Random = UnityEngine.Random;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Game.Rust.Cui;
+using Physics = UnityEngine.Physics;
+using Facepunch;
+using FIMSpace.Generating;
+using Time = UnityEngine.Time;
+
+/*
+ * Changelog
+ *
+ * Version 1.3.5
+ * - Removed Launch site from spawn pool.
+ */
+
+namespace Oxide.Plugins
+{
+    [Info("The Dealer", "Wrecks", "1.3.5")]
+    [Description("Spawns an NPC simulating deals the player makes with them for $")]
+    public class TheDealer : RustPlugin
+    {
+        [PluginReference] private Plugin Economics, ServerRewards, Kits, MarkerManager, ImageLibrary, Drugs;
+
+        #region Fields
+
+        private Timer _topDealersTimer;
+        private Timer _inDemandTimer;
+        private Dictionary<ulong, int> _saleScore = new();
+        private List<Dictionary<string, object>> _drugList;
+        private readonly Dictionary<ulong, float> _cooldowns = new();
+        private readonly List<NPCTalking> _traderNpCs = new();
+        private readonly Dictionary<ulong, NPCTalking> _callerDealerPair = new();
+        private readonly Dictionary<ulong, (NPCTalking npc, int saleCount)> _salecount = new();
+        private readonly Dictionary<ulong, (NPCTalking npc, string monumentName, string grid)> _monumentName = new();
+        private readonly HashSet<BasePlayer> _burnerCooldown = new();
+        private readonly HashSet<StorageContainer> _lootedContainers = new();
+        private readonly List<MonumentInfo> _monumentInfo = new();
+        private readonly Dictionary<BasePlayer, Timer> _timer1 = new();
+        private readonly Dictionary<BasePlayer, Timer> _timer2 = new();
+        private readonly Dictionary<BasePlayer, Timer> _timer3 = new();
+        private const string NoticeFx = "assets/bundled/prefabs/fx/notice/item.select.fx.prefab";
+        private const string Vibrate = "assets/prefabs/tools/pager/effects/vibrate.prefab";
+        private const string DeniedFx = "assets/prefabs/locks/keypad/effects/lock.code.denied.prefab";
+        private const string CashFx = "assets/prefabs/deployable/vendingmachine/effects/vending-machine-purchase-human.prefab";
+        private const string Npc = "assets/prefabs/npc/bandit/missionproviders/missionprovider_bandit_a.prefab";
+        private const string SrFx = "assets/prefabs/food/small water bottle/effects/water-bottle-deploy.prefab";
+        private const string FailFx = "assets/prefabs/instruments/jerrycanguitar/effects/guitardeploy.prefab";
+        private const string PhoneFx = "assets/prefabs/voiceaudio/telephone/effects/telephone-deploy.prefab";
+        private const string LeoPermission = "TheDealer.LawEnforcement";
+        private const string DealerGif = "https://codefling.com/uploads/monthly_2025_01/Dealer(4).gif.df856235528218778f13299dd87e0a60.gif";
+        private const string DrugsGif = "https://codefling.com/uploads/monthly_2025_01/DGif(3).gif.7f3200d42ac98f8cf236c09a1fc4afcb.gif";
+        private bool _fullyLoaded;
+        private string _url;
+        private string _topWebhook;
+
+        #endregion
+
+        #region Config
+
+        private static Configuration _config;
+
+        public class MarkerSettings
+        {
+            [JsonProperty("Dealer Marker Radius")] public float DealerRadius;
+            [JsonProperty("Dealer Marker Color")] public string DealerColor;
+            [JsonProperty("Dealer Marker Outline")] public string DealerOutline;
+            [JsonProperty("Dealer Marker Alpha")] public float DealerAlpha;
+        }
+
+        private class Configuration
+        {
+            [JsonProperty("Marker Settings")] public MarkerSettings MarkerSettings;
+            [JsonProperty("In Demand Item Setup")] public InDemandItemSetup InDemandItemSetup;
+            [JsonProperty("Enable Reputation Levels?")] public bool EnableReputation;
+            [JsonProperty("Wipe Reputation Levels On Wipe?")] public bool WipeRep;
+            [JsonProperty("Wipe Sale Data Leaderboard On Wipe?")] public bool WipeSaleData;
+            [JsonProperty("Announce Top Ranks To Discord?")] public bool TopRanksToDiscord;
+            [JsonProperty("Announce Top Ranks To Chat?")] public bool TopRanksToChat;
+            [JsonProperty("Enable Kingpin Overtakes?")] public bool EnableKingpin;
+            [JsonProperty("Minimum Amount of Items Traded to Be earn Kingpin?")] public int KingpinMin;
+            [JsonProperty("Kingpin Group Name?")] public string KingpinGroup;
+            [JsonProperty("Announcement Interval In Seconds? 0 = Disabled")] public int AnnounceInterval;
+            [JsonProperty("Discord Webhook URL For Top Ranks")] public string TopWebhook;
+            [JsonProperty("Reputation Levels 0.01 = 1% Boost To Sales (Increases Base Sale Price, Keep in Mind Variation Settings)")] public Dictionary<int, LevelConfig> ReputationLevels;
+            [JsonProperty("Log Burner Phone uses to Discord?")] public bool LogCalls;
+            [JsonProperty("Prefab path of the Container to spawn a Burner Phone in")] public string PrefabPath;
+            [JsonProperty("Min amount of Burners to spawn")] public int MinAmount;
+            [JsonProperty("Max amount of Burners to spawn")] public int MaxAmount;
+            [JsonProperty("Chance to spawn a Burner Phone in a container (0 = 0%, 100 = 100%)")] public float BurnerChance;
+            [JsonProperty("Burner Skin")] public ulong BurnerSkin;
+            [JsonProperty("Chance To Notify Police?")] public int PoliceChance;
+            [JsonProperty("Mini Toast Image")] public string MiniToastImage;
+            [JsonProperty("How long before Dealer Despawns in Seconds")] public int WaitTime;
+            [JsonProperty("Use Permission Name")] public string UsePermissionName;
+            [JsonProperty("Discord Webhook URL")] public string Webhook;
+            [JsonProperty("Chat Icon")] public ulong ChatIcon;
+            [JsonProperty("NPC Kit Enabled?")] public bool NpcKitEnabled;
+            [JsonProperty("NPC Kit Name?")] public string NpcKitName;
+            [JsonProperty("Map Markers Enabled via Marker Manager Plugin?")] public bool MarkersEnabled;
+            [JsonProperty("Maximum Amount of Items Sold at a Time")] public int MaxTradeQuantity;
+            [JsonProperty("NPC Interaction Cooldown In Seconds")] public float InteractionCooldown;
+            [JsonProperty("Economy Plugin - 1 Economics - 2 Server Rewards")] public int EconomyPlugin;
+            [JsonProperty("Enable Custom Currency? (OVERRIDES ECONOMY PLUGIN)")] public bool CustomCurrencyEnabled;
+            [JsonProperty("Custom Currency")] public CustomCurrency CustomCurrency;
+            [JsonProperty("Tradeable Items")] public List<TradeableItems> TradeableItemsList;
+            [JsonProperty("NPC Clothing Options")] public List<ClothingOption> NpcClothingOptions;
+
+            public static Configuration DefaultConfig()
+            {
+                return new Configuration {
+                    MarkerSettings = new MarkerSettings() {
+                        DealerRadius = 0.2f,
+                        DealerColor = "E27308",
+                        DealerOutline = "06040B",
+                        DealerAlpha = 0.75f
+                    },
+                    InDemandItemSetup = new InDemandItemSetup {
+                        MaxInDemandItems = 5,
+                        MinMultiplier = 0.1f,
+                        MaxMultiplier = 0.5f,
+                        CycleTime = 120
+                    },
+                    EnableReputation = false,
+                    WipeRep = false,
+                    WipeSaleData = false,
+                    TopRanksToChat = false,
+                    TopRanksToDiscord = false,
+                    EnableKingpin = false,
+                    KingpinMin = 10000,
+                    KingpinGroup = "Kingpin",
+                    TopWebhook = "INSERT_WEBHOOK_URL",
+                    AnnounceInterval = 0,
+                    ReputationLevels = new Dictionary<int, LevelConfig> {
+                        { 1, new LevelConfig { ItemsRequired = 200, Bonus = 0.01f } },
+                        { 2, new LevelConfig { ItemsRequired = 300, Bonus = 0.02f } },
+                        { 3, new LevelConfig { ItemsRequired = 400, Bonus = 0.03f } },
+                        { 4, new LevelConfig { ItemsRequired = 500, Bonus = 0.04f } },
+                        { 5, new LevelConfig { ItemsRequired = 550, Bonus = 0.05f } },
+                        { 6, new LevelConfig { ItemsRequired = 600, Bonus = 0.06f } },
+                        { 7, new LevelConfig { ItemsRequired = 750, Bonus = 0.07f } },
+                        { 8, new LevelConfig { ItemsRequired = 800, Bonus = 0.08f } },
+                        { 9, new LevelConfig { ItemsRequired = 950, Bonus = 0.09f } },
+                        { 10, new LevelConfig { ItemsRequired = 1000, Bonus = 0.10f } }
+                    },
+                    LogCalls = false,
+                    PrefabPath = "assets/bundled/prefabs/radtown/crate_normal.prefab",
+                    MinAmount = 1,
+                    MaxAmount = 2,
+                    BurnerChance = 20f,
+                    BurnerSkin = 3273293561,
+                    PoliceChance = 80,
+                    MiniToastImage = "https://www.dropbox.com/scl/fi/hjfifjdd5esv01i5xxylf/miniGlow.png?rlkey=iz8gher6qynaro9oj3r8niamp&st=ei6x54qf&dl=1",
+                    WaitTime = 60,
+                    UsePermissionName = "TheDealer.Use",
+                    Webhook = "INSERT_WEBHOOK_URL",
+                    ChatIcon = 0,
+                    NpcKitEnabled = false,
+                    NpcKitName = "",
+                    MarkersEnabled = false,
+                    MaxTradeQuantity = 3,
+                    InteractionCooldown = 3f,
+                    EconomyPlugin = 1,
+                    CustomCurrencyEnabled = false,
+                    CustomCurrency = new CustomCurrency {
+                        CustomName = "Dirty Cash",
+                        Shortname = "paper",
+                        Skin = 3347697156
+                    },
+                    NpcClothingOptions = new List<ClothingOption> {
+                        new() {
+                            Shortname = "pants",
+                            Skin = 838673197
+                        },
+                        new() {
+                            Shortname = "hoodie",
+                            Skin = 792923214
+                        },
+                        new() {
+                            Shortname = "shoes.boots",
+                            Skin = 2956831315
+                        },
+                        new() {
+                            Shortname = "hat.cap",
+                            Skin = 1492905789
+                        }
+                    },
+                    TradeableItemsList = new List<TradeableItems> {
+                        new() {
+                            ShortName = "blood",
+                            CustomName = "",
+                            SkinID = 0,
+                            Sellable = true,
+                            Score = 1,
+                            SalePrice = 40,
+                            MaxDiscount = -10,
+                            MaxBonus = 5
+                        },
+                        new() {
+                            ShortName = "sticks",
+                            CustomName = "",
+                            SkinID = 0,
+                            Sellable = true,
+                            Score = 1,
+                            SalePrice = 100,
+                            MaxDiscount = -10,
+                            MaxBonus = 5
+                        },
+                        new() {
+                            ShortName = "glue",
+                            CustomName = "",
+                            SkinID = 0,
+                            Sellable = true,
+                            Score = 1,
+                            SalePrice = 250,
+                            MaxDiscount = -10,
+                            MaxBonus = 5
+                        },
+                        new() {
+                            ShortName = "bleach",
+                            CustomName = "",
+                            SkinID = 0,
+                            Sellable = true,
+                            Score = 1,
+                            SalePrice = 20,
+                            MaxDiscount = -10,
+                            MaxBonus = 5
+                        }
+                    }
+                };
+            }
+        }
+
+        protected override void LoadConfig()
+        {
+            base.LoadConfig();
+            try
+            {
+                _config = Config.ReadObject<Configuration>();
+                if (_config == null) LoadDefaultConfig();
+                if (_config is { MarkerSettings: null })
+                {
+                    _config.MarkerSettings = Configuration.DefaultConfig().MarkerSettings;
+                    Puts("Adding Marker Settings To Config.");
+                }
+                if (_config is { CustomCurrency: null })
+                {
+                    _config.CustomCurrency = Configuration.DefaultConfig().CustomCurrency;
+                    Puts("Adding Custom Currency Option");
+                }
+                if (_config is { InDemandItemSetup: null })
+                {
+                    _config.InDemandItemSetup = Configuration.DefaultConfig().InDemandItemSetup;
+                    Puts("Adding In Demand Item Setup");
+                }
+                SaveConfig();
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                PrintWarning("Creating a new config file.");
+                LoadDefaultConfig();
+            }
+        }
+
+        protected override void LoadDefaultConfig()
+        {
+            _config = Configuration.DefaultConfig();
+        }
+
+        protected override void SaveConfig()
+        {
+            Config.WriteObject(_config);
+        }
+
+        #endregion
+
+        #region Lang
+
+        protected override void LoadDefaultMessages()
+        {
+            lang.RegisterMessages(new Dictionary<string, string> {
+                ["NoPerms"] = "[<color=#ef6500>The Dealer</color>] We shouldn't even be Talking...",
+                ["NoWares"] = "[<color=#ef6500>The Dealer</color>] :mask: You have no <color=green>Items</color> on you worth Buying. \nDid you Call me up for nothing?!",
+                ["TraderCooldownMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: Hold up, <color=green>{0}</color> second(s), I think you were tailed here...",
+                ["EconomicsMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n I can give you <color=#85bb65>$</color><color=yellow>{0}</color> for your <color=orange>{1}x</color> <color=green>{2}</color>(s).",
+                ["SrMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n I can give you <color=orange>{0}</color> <color=#cd5c5c>RP</color> for your <color=yellow>{1}x</color> <color=green>{2}</color>(s).",
+                ["CustomCurrencyMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n I can give you <color=orange>{0}</color> <color=#cd5c5c>{1}</color> for your <color=yellow>{2}x</color> <color=green>{3}</color>(s).",
+                ["HydraMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n I can give you <color=orange>{0}</color> <color=#cd5c5c>BTC</color> for your <color=yellow>{1}x</color> <color=green>{2}</color>(s).",
+                ["DrugsCustomCurrencyMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n <color=green>Whoa!</color>, I can give you <color=orange>{0}</color> <color=#cd5c5c>{1}</color> for your <color=yellow>{2}x</color> <color=green>{3}</color>(s).",
+                ["DrugsEconomicsMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n <color=green>Whoa!</color>, I can give you <color=#85bb65>$</color><color=yellow>{0}</color> for your <color=orange>{1}x</color> <color=green>{2}</color>(s).",
+                ["DrugsSrMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n <color=green>Whoa!</color>, I can give you <color=orange>{0}</color> <color=#cd5c5c>RP</color> for your <color=yellow>{1}x</color> <color=green>{2}</color>(s).",
+                ["DrugsHydraMessage"] = "[<color=#ef6500>The Dealer</color>] :mask: \n\n <color=green>Whoa!</color>,  I can give you <color=orange>{0}</color> <color=#cd5c5c>BTC</color> for your <color=yellow>{1}x</color> <color=green>{2}</color>(s).",
+                ["WhoAreYou"] = "[<color=#ef6500>The Dealer</color>] Hold up, You aren't <color=green>{0}</color>, Are you a <color=yellow>Cop</color>? \n :mask:",
+                ["InRoute"] = "[<color=#ef6500>The Dealer</color>] The <color=red>Buyer</color> is already on the way\n to <color=#ef6500>{0}</color> near <color=#ef6500>{1}</color>.",
+                ["NoRoute"] = "[<color=#ef6500>The Dealer</color>] Use a <color=red>Burner Phone</color>\n to meet up with a <color=red>Buyer</color>.",
+                ["MeetupMessage"] = "{0}, near {1}, be there.\nHave the work Packaged",
+                ["BusinessMessage"] = "{0}!\n Nice doing Business.",
+                ["WasteTimeMessage"] = "{0}!\nDon't waste my time!",
+                ["NotifyCops"] = "[<color=#ef6500>The Dealer</color>] An Anonymous Tip says a Deal is going down, The Marked Location can be found on your Map.",
+                ["RepUp"] = "Your Reputation has increased to <color=green>{0}</color>\nYou will now receive a bonus of <color=green>{1}</color> on Sales.",
+                ["RepCheck"] = "Your Rep is <color=green>{0}</color>\nThis gives a bonus of <color=green>{1}</color> on Sales.",
+                ["RepCheckMax"] = "Your Rep is now Max of <color=green>{0}</color>!\nThis gives a bonus of <color=green>{1}</color> on Sales.",
+                ["KingpinLost"] = "[<color=#ef6500>The Dealer</color>] Your <color=red>Kingpin Rank</color> has been <color=red>Lost</color>.",
+                ["KingpinGained"] = "[<color=#ef6500>The Dealer</color>] The new <color=red>Kingpin</color> is <color=green>{0}</color>.",
+                ["InDemand"] = "[<color=#ef6500>The Dealer</color>] <color=green>{0}</color> is in Demand Right Now!"
+            }, this);
+        }
+
+        #endregion
+
+        #region NPCClothing
+
+        private class ClothingOption
+        {
+            [JsonProperty("Shortname")] public string Shortname;
+            [JsonProperty("Skin")] public ulong Skin;
+        }
+
+        #endregion
+
+        #region RewardHandling
+
+        private void Payout(BasePlayer player, int quantity, int basePrice, float minDiscount, float maxBonus, string name, bool isDrugs, bool inDemand)
+        {
+            var f = 0f;
+            if (!inDemand)
+            {
+                f = Random.Range(minDiscount, maxBonus + 1);
+                f = Mathf.Clamp(f, -100f, 100f);
+            }
+            var multiplier = GetBonusForPlayer(_repData[player.userID]);
+            var newPrice = basePrice * (1 + f / 100f) * (1 + multiplier);
+            var total = quantity * Mathf.Max(1, Mathf.CeilToInt(newPrice));
+            var currency = GetCurrencyName();
+            if (_config.CustomCurrencyEnabled)
+            {
+                var key = isDrugs ? "DrugsCustomCurrencyMessage" : "CustomCurrencyMessage";
+                var s = string.Format(lang.GetMessage(key, this, player.UserIDString), total, currency, quantity, name);
+                Player.Message(player, s, null, _config.ChatIcon);
+                SendEffect(player, CashFx);
+                SendTrade(player, name, quantity, total, isDrugs ? "Drug Deal" : "The Dealer", isDrugs ? DrugsGif : DealerGif, inDemand);
+                GiveCustomCurrency(player, total);
+                return;
+            }
+            Payout(player, quantity, name, isDrugs, inDemand, total);
+        }
+
+        private void Payout(BasePlayer player, int quantity, string name, bool isDrugs, bool inDemand, int total)
+        {
+            switch (_config.EconomyPlugin)
+            {
+                case 1:
+                    Economics.Call("Deposit", player.UserIDString, (double)total);
+                    Player.Message(player, string.Format(lang.GetMessage(isDrugs ? "DrugsEconomicsMessage" : "EconomicsMessage", this, player.UserIDString), total, quantity, name), null, _config.ChatIcon);
+                    SendEffect(player, CashFx);
+                    SendTrade(player, name, quantity, total, isDrugs ? "Drug Deal" : "The Dealer", isDrugs ? DrugsGif : DealerGif, inDemand);
+                    break;
+                case 2:
+                    ServerRewards.Call("AddPoints", player.UserIDString, total);
+                    Player.Message(player, string.Format(lang.GetMessage(isDrugs ? "DrugsSrMessage" : "SrMessage", this, player.UserIDString), total, quantity, name), null, _config.ChatIcon);
+                    SendEffect(player, SrFx);
+                    SendTrade(player, name, quantity, total, isDrugs ? "Drug Deal" : "The Dealer", isDrugs ? DrugsGif : DealerGif, inDemand);
+                    break;
+                case 3: // Hydra
+                    Interface.CallHook("HydraPayout", player, total);
+                    Player.Message(player, string.Format(lang.GetMessage(isDrugs ? "DrugsHydraMessage" : "HydraMessage", this, player.UserIDString), total, quantity, name), null, _config.ChatIcon);
+                    SendEffect(player, CashFx);
+                    SendTrade(player, name, quantity, total, isDrugs ? "Drug Deal" : "The Dealer", isDrugs ? DrugsGif : DealerGif, inDemand);
+                    break;
+            }
+        }
+
+        #endregion
+
+        #region Items
+
+        public class CustomCurrency
+        {
+            [JsonProperty("Shortname")] public string Shortname;
+            [JsonProperty("Skin")] public ulong Skin;
+            [JsonProperty("Custom Name")] public string CustomName;
+        }
+
+        private class TradeableItems
+        {
+            [JsonProperty("Item ShortName")] public string ShortName;
+            [JsonProperty("Item CustomName")] public string CustomName;
+            [JsonProperty("Skin ID")] public ulong SkinID;
+            [JsonProperty("Is Marketable?")] public bool Sellable;
+            [JsonProperty("Dealer Score (Leaderboard)")] public int Score;
+            [JsonProperty("Sale Price?")] public double SalePrice;
+            [JsonProperty("Max Discount Buy Variation in %? (Negative Values) (To Simulate Supply & Demand)")] public float MaxDiscount;
+            [JsonProperty("Maximum Bonus Variation in %? (Positive Values) (To Simulate Supply & Demand)")] public float MaxBonus;
+
+            public string GetDisplayName()
+            {
+                return string.IsNullOrEmpty(CustomName) ? ItemManager.FindItemDefinition(ShortName)?.displayName?.translated : CustomName;
+            }
+        }
+
+        #endregion
+
+        #region Helpers
+
+        private string GetCurrencyName()
+        {
+            if (_config.CustomCurrencyEnabled)
+                return string.IsNullOrEmpty(_config.CustomCurrency.CustomName) ? ItemManager.FindItemDefinition(_config.CustomCurrency.Shortname)?.displayName?.english ?? "Currency" : _config.CustomCurrency.CustomName;
+            return _config.EconomyPlugin switch {
+                1 => "$",
+                2 => "RP",
+                3 => "BTC",
+                _ => "Balance"
+            };
+        }
+
+        private string RemoveTags(string text)
+        {
+            const string s = "<(color|size)=[^>]*>|</(color|size)>";
+            return Regex.Replace(text, s, "");
+        }
+
+        private void LoadImage()
+        {
+            ImageLibrary?.Call("AddImage", _config.MiniToastImage, _config.MiniToastImage);
+            _fullyLoaded = true;
+            Puts("Initialized");
+        }
+
+        private void RegisterPermissions()
+        {
+            permission.RegisterPermission(_config.UsePermissionName, this);
+            permission.RegisterPermission(LeoPermission, this);
+        }
+
+        private object OnNpcKits(NPCTalking npc)
+        {
+            return _traderNpCs.Contains(npc) ? true : null;
+        }
+
+        private void ClearUI()
+        {
+            for (var i = BasePlayer.activePlayerList.Count - 1; i >= 0; i--)
+            {
+                DestroyAllUi(BasePlayer.activePlayerList[i]);
+            }
+        }
+
+        private void ClearTraders()
+        {
+            foreach (var npc in _traderNpCs)
+            {
+                if (npc != null && !npc.IsDestroyed)
+                {
+                    npc.Kill();
+                }
+            }
+        }
+
+        private static bool InRange(Vector3 a, Vector3 b, float distance)
+        {
+            return (a - b).sqrMagnitude <= distance * distance;
+        }
+
+        private void CheckPlugins()
+        {
+            if (!Economics && !ServerRewards && !_config.CustomCurrencyEnabled && _config.EconomyPlugin != 3)
+            {
+                Puts("Economics or ServerRewards need to be loaded to have NPCs spawned and handle trades! Alternatively you can Enable Custom Currency in the Config, Unloading.");
+                Interface.Oxide.UnloadPlugin("TheDealer");
+                return;
+            }
+            if (!MarkerManager)
+            {
+                Puts("MarkerManager needs to be loaded to have the The Dealer Location Displayed!");
+            }
+            if (!ImageLibrary)
+            {
+                Puts("ImageLibrary needs to be loaded to use the UI Toast Images");
+                Interface.Oxide.UnloadPlugin("TheDealer");
+            }
+            if (!Drugs)
+            {
+                Puts("The Drugs Plugin By Wrecks can be used to integrate Custom Drug items with The Dealer");
+            }
+            else if (Drugs && !(bool)Interface.CallHook("DealerIntegration"))
+            {
+                Puts("The Drugs Plugin By Wrecks is loaded but not Set up to work with The Dealer.");
+            }
+            else if (Drugs && (bool)Interface.CallHook("DealerIntegration"))
+            {
+                CacheDrugList();
+            }
+        }
+
+        private void CacheDrugList()
+        {
+            if (Interface.CallHook("GetDrugList") is List<Dictionary<string, object>> list)
+            {
+                _drugList = list;
+                Puts("Drugs Integration Enabled");
+            }
+        }
+
+        #endregion
+
+        #region Hooks
+
+        private object CanBeTargeted(NPCTalking component, AutoTurret instance)
+        {
+            if (component == null || instance == null)
+            {
+                return null;
+            }
+            if (_traderNpCs.Contains(component))
+            {
+                return false;
+            }
+            return null;
+        }
+
+        private void OnEntitySpawned(MapMarkerMissionProvider marker)
+        {
+            if (marker == null || marker.IsDestroyed) return;
+            foreach (var npc in _traderNpCs)
+            {
+                if (npc == null || npc.transform == null || marker.transform == null) continue;
+                if (InRange(npc.transform.position, marker.transform.position, 0.1f))
+                {
+                    NextTick(() => marker.Kill());
+                }
+            }
+        }
+
+        private void OnNewSave(string strFilename)
+        {
+            if (!_config.WipeRep && !_config.WipeSaleData) return;
+            LoadData();
+            if (_config.WipeRep)
+            {
+                _repData.Clear();
+            }
+            if (_config.WipeSaleData)
+            {
+                RemoveFromGroup();
+                _saleScore.Clear();
+            }
+            SaveData();
+        }
+
+        private void RemoveFromGroup()
+        {
+            var list = Pool.Get<List<ulong>>();
+            list.AddRange(_saleScore.Keys);
+            foreach (var id in list)
+            {
+                if (!permission.UserHasGroup(id.ToString(), _config.KingpinGroup)) continue;
+                permission.RemoveUserGroup(id.ToString(), _config.KingpinGroup);
+                var message = "Removed User from the Kingpin Group Due to Wipe.";
+                Puts(message);
+            }
+            if (_config.TopRanksToDiscord)
+            {
+                SendTop("Kingpin Progress Reset.");
+            }
+            Pool.FreeUnmanaged(ref list);
+        }
+
+        private object OnEntityTakeDamage(BaseEntity entity, HitInfo info)
+        {
+            if (entity == null || info?.Initiator == null)
+            {
+                return null;
+            }
+            if (_traderNpCs.Contains(entity))
+            {
+                return false;
+            }
+            return null;
+        }
+
+        private void OnServerInitialized()
+        {
+            Puts("Initializing...");
+            Unsubscribe(nameof(CanBeTargeted));
+            _fullyLoaded = false;
+            _url = _config.Webhook;
+            _topWebhook = _config.TopWebhook;
+            if (_config.EnableReputation)
+            {
+                LoadData();
+            }
+            timer.Once(1f, CheckPlugins);
+            timer.Once(2.5f, () =>
+            {
+                RegisterPermissions();
+                LoadMonumentInfo();
+                LoadImage();
+                UpdateKingpin();
+                StartInDemand();
+            });
+            if (_config.AnnounceInterval > 0)
+            {
+                _topDealersTimer = timer.Every(_config.AnnounceInterval, AnnounceTopDealers);
+            }
+        }
+
+        private void StartInDemand()
+        {
+            if (_config.InDemandItemSetup.MaxInDemandItems <= 0) return;
+            if (_config.CustomCurrencyEnabled)
+            {
+                Puts("When using custom currency be sure to use whole numbers (1,2,3 etc.) as in demand min / max as you cannot give half items.");
+            }
+            RollInDemandItems();
+            _inDemandTimer = timer.Every(_config.InDemandItemSetup.CycleTime * 60f, RollInDemandItems);
+        }
+
+        private void Unload()
+        {
+            TallyRemainingCounts();
+            ClearTraders();
+            ClearUI();
+            SaveData();
+            _topDealersTimer?.Destroy();
+            _inDemandTimer?.Destroy();
+            _config = null;
+        }
+
+        #region Loot
+
+        private void CanLootEntity(BasePlayer player, LootContainer container)
+        {
+            if (player == null || container == null)
+            {
+                return;
+            }
+            CheckContainer(container);
+        }
+
+        private void CheckContainer(LootContainer container)
+        {
+            if (_lootedContainers.Contains(container)) return;
+            if (_config.PrefabPath != container.name) return;
+            {
+                TryAdd(container);
+            }
+            _lootedContainers.Add(container);
+
+        }
+
+        private void TryAdd(LootContainer container)
+        {
+            if (!(Random.Range(0f, 100f) <= _config.BurnerChance)) return;
+            var amount = Random.Range(_config.MinAmount, _config.MaxAmount + 1);
+            GetBurner(out var item, amount);
+            if (!container.inventory.GiveItem(item))
+            {
+                item.MoveToContainer(container.inventory);
+            }
+        }
+
+        #endregion
+
+        private void TallyRemainingCounts()
+        {
+            foreach (var entry in _salecount)
+            {
+                var player = entry.Key;
+                var saleCount = entry.Value.saleCount;
+                if (saleCount > 0)
+                {
+                    UpdateSaleScore(player, saleCount);
+                }
+            }
+            _salecount.Clear();
+        }
+
+        private object OnNpcConversationStart(NPCTalking trader, BasePlayer player)
+        {
+            if (!_traderNpCs.Contains(trader)) return null;
+            if (!permission.UserHasPermission(player.UserIDString, _config.UsePermissionName))
+            {
+                NoPerms(player);
+                return false;
+            }
+            if (!_callerDealerPair.TryGetValue(player.userID, out var npc))
+            {
+                NotCaller(trader, player);
+                return false;
+            }
+            if (_cooldowns.ContainsKey(player.userID) && Time.realtimeSinceStartup < _cooldowns[player.userID])
+            {
+                OnCooldown(player);
+                return true;
+            }
+            _cooldowns[player.userID] = Time.realtimeSinceStartup + _config.InteractionCooldown;
+            Trade(player, trader);
+            return true;
+        }
+
+        private void OnCooldown(BasePlayer player)
+        {
+            var f = _cooldowns[player.userID] - Time.realtimeSinceStartup;
+            var s = lang.GetMessage("TraderCooldownMessage", this, player.UserIDString);
+            Player.Message(player, string.Format(s, (int)Math.Ceiling(f)), null, _config.ChatIcon);
+            SendEffect(player, DeniedFx);
+        }
+
+        private void NoPerms(BasePlayer player)
+        {
+            var s = lang.GetMessage("NoPerms", this, player.UserIDString);
+            Player.Message(player, s, null, _config.ChatIcon);
+            SendEffect(player, DeniedFx);
+        }
+
+        private void NotCaller(NPCTalking trader, BasePlayer player)
+        {
+            var key = _callerDealerPair.FirstOrDefault(pair => pair.Value == trader).Key;
+            var playername = BasePlayer.FindAwakeOrSleepingByID(key).displayName;
+            var contact = playername ?? "The Contact";
+            var format = string.Format(lang.GetMessage("WhoAreYou", this, player.UserIDString), contact);
+            Player.Message(player, format, null, _config.ChatIcon);
+            SendEffect(player, DeniedFx);
+        }
+
+        private void IncrementSaleCount(ulong id, NPCTalking npc, int quantity)
+        {
+            if (_salecount.TryGetValue(id, out var saleData))
+            {
+                _salecount[id] = (saleData.Item1, saleData.Item2 + quantity);
+            }
+            else
+            {
+                _salecount[id] = (npc, quantity);
+            }
+        }
+
+        #endregion
+
+        #region TradeHandler
+
+        private void Trade(BasePlayer player, NPCTalking npc)
+        {
+            foreach (var item in _config.TradeableItemsList)
+            {
+                if (!item.Sellable || !HasItems(player, item)) continue;
+                var quantity = GetTotalItems(player, item);
+                if (quantity > _config.MaxTradeQuantity) quantity = _config.MaxTradeQuantity;
+                RemoveItems(player, item, quantity);
+                var price = (int)item.SalePrice;
+                var inDemand = false;
+                if (_inDemandItems.TryGetValue(item.SkinID, out var demandMult))
+                {
+                    inDemand = true;
+                    price = Mathf.CeilToInt(price * (1f + demandMult));
+                }
+                var name = item.GetDisplayName();
+                Payout(player, quantity, price, item.MaxDiscount, item.MaxBonus, name, false, inDemand);
+                if (_inDemandItems.ContainsKey(item.SkinID))
+                {
+                    var s = lang.GetMessage("InDemand", this, player.UserIDString);
+                    timer.Once(0.5f, () => { player.ChatMessage(string.Format(s, name)); });
+                }
+                IncrementSaleCount(player.userID, npc, item.Score * quantity);
+                return;
+            }
+            if (CheckDrugs(player, npc))
+            {
+                return;
+            }
+            var message = lang.GetMessage("NoWares", this, player.UserIDString);
+            Player.Message(player, string.Format(message), null, _config.ChatIcon);
+            SendEffect(player, FailFx);
+        }
+
+        private bool CheckDrugs(BasePlayer player, NPCTalking npc)
+        {
+            if (!Drugs || !(bool)Interface.CallHook("DealerIntegration")) return false;
+            {
+                var list = _drugList;
+                if (list == null || list.Count == 0)
+                {
+                    return true;
+                }
+                foreach (var drug in list)
+                {
+                    try
+                    {
+                        if (drug == null)
+                        {
+                            continue;
+                        }
+                        if (!drug.TryGetValue("Skin", out var value))
+                        {
+                            continue;
+                        }
+                        var skinId = Convert.ToUInt64(value);
+                        if (!(bool)Interface.CallHook("HasDrugs", player, skinId))
+                        {
+                            continue;
+                        }
+                        if (skinId == _config.BurnerSkin)
+                        {
+                            continue;
+                        }
+                        var isMarketable = (bool?)Interface.CallHook("IsMarketableDrug", skinId);
+                        if (isMarketable == null)
+                        {
+                            continue;
+                        }
+                        if (!isMarketable.Value)
+                        {
+                            continue;
+                        }
+                        var quantity = (int)Interface.CallHook("GetTotalDrugs", player, skinId);
+                        if (quantity <= 0)
+                        {
+                            continue;
+                        }
+                        if (quantity > _config.MaxTradeQuantity)
+                        {
+                            quantity = _config.MaxTradeQuantity;
+                        }
+                        Interface.CallHook("RemoveDrugs", player, skinId, quantity);
+                        var price = Interface.CallHook("GetDrugPrice", skinId);
+                        if (price == null)
+                        {
+                            continue;
+                        }
+                        var score = (int?)Interface.CallHook("GetDrugScore", skinId) ?? 1;
+                        var drugDiscount = (float?)Interface.CallHook("GetDrugDiscount", skinId);
+                        if (drugDiscount == null)
+                        {
+                            continue;
+                        }
+                        var drugBonus = (float?)Interface.CallHook("GetDrugBonus", skinId);
+                        if (drugBonus == null)
+                        {
+                            continue;
+                        }
+                        var name = (string)Interface.CallHook("GetDrugName", skinId);
+                        var finalPrice = (int)price;
+                        var inDemand = false;
+                        if (_inDemandItems.TryGetValue(skinId, out var demandMult))
+                        {
+                            inDemand = true;
+                            price = Mathf.CeilToInt(finalPrice * (1f + demandMult));
+                        }
+                        Payout(player, quantity, (int)price, drugDiscount.Value, drugBonus.Value, name, true, inDemand);
+                        if (_inDemandItems.ContainsKey(skinId))
+                        {
+                            var s = lang.GetMessage("InDemand", this, player.UserIDString);
+                            timer.Once(0.5f, () => { player.ChatMessage(string.Format(s, name)); });
+                        }
+                        IncrementSaleCount(player.userID, npc, score * quantity);
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        Puts($"Error processing {drug?["Name"]}");
+                    }
+                }
+            }
+            return false;
+        }
+
+        private void GiveCustomCurrency(BasePlayer player, int total)
+        {
+            var currency = ItemManager.CreateByName(_config.CustomCurrency.Shortname, total, _config.CustomCurrency.Skin);
+            if (!string.IsNullOrEmpty(_config.CustomCurrency.CustomName))
+            {
+                currency.name = _config.CustomCurrency.CustomName;
+            }
+            player.GiveItem(currency);
+        }
+
+        private void RemoveItems(BasePlayer player, TradeableItems target, int quantity)
+        {
+            var allItems = Pool.Get<List<Item>>();
+            try
+            {
+                allItems.AddRange(player.inventory.containerMain.itemList);
+                allItems.AddRange(player.inventory.containerBelt.itemList);
+                foreach (var item in allItems)
+                {
+                    if (item.skin != target.SkinID) continue;
+                    var itemsToRemove = Mathf.Min(item.amount, quantity);
+                    if (item.amount > itemsToRemove)
+                    {
+                        item.amount -= itemsToRemove;
+                        item.MarkDirty();
+                    }
+                    else
+                    {
+                        item.RemoveFromContainer();
+                        item.Remove();
+                    }
+                    quantity -= itemsToRemove;
+                    if (quantity <= 0)
+                        break;
+                }
+            }
+            finally
+            {
+                Pool.FreeUnmanaged(ref allItems);
+            }
+        }
+
+        private int GetTotalItems(BasePlayer player, TradeableItems target)
+        {
+            var quantity = 0;
+            var allItems = Pool.Get<List<Item>>();
+            try
+            {
+                allItems.AddRange(player.inventory.containerMain.itemList);
+                allItems.AddRange(player.inventory.containerBelt.itemList);
+                foreach (var item in allItems)
+                {
+                    if (item.skin == target.SkinID && item.info.shortname == target.ShortName)
+                    {
+                        quantity += item.amount;
+                    }
+                }
+            }
+            finally
+            {
+                Pool.FreeUnmanaged(ref allItems);
+            }
+            return quantity;
+        }
+
+        private bool HasItems(BasePlayer player, TradeableItems target)
+        {
+            var allItems = Pool.Get<List<Item>>();
+            try
+            {
+                allItems.AddRange(player.inventory.containerMain.itemList);
+                allItems.AddRange(player.inventory.containerBelt.itemList);
+                foreach (var item in allItems)
+                {
+                    if (item.skin == target.SkinID && item.info.shortname == target.ShortName)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            finally
+            {
+                Pool.FreeUnmanaged(ref allItems);
+            }
+        }
+
+        #endregion
+
+        #region Reputation
+
+        private Dictionary<ulong, RepData> _repData = new();
+
+        private class RepData
+        {
+            public int Level;
+            public int ItemsSold;
+        }
+
+        private void LoadData()
+        {
+            var data = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<ulong, RepData>>("TheDealer" + "/RepData");
+            _repData = data ?? new Dictionary<ulong, RepData>();
+            var scoreData = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<ulong, int>>("TheDealer" + "/SaleData");
+            _saleScore = scoreData ?? new Dictionary<ulong, int>();
+        }
+
+        private void SaveData()
+        {
+            Interface.GetMod().DataFileSystem.WriteObject("TheDealer" + "/RepData", _repData);
+            Interface.GetMod().DataFileSystem.WriteObject("TheDealer" + "/SaleData", _saleScore);
+        }
+
+        private class LevelConfig
+        {
+            [JsonProperty("Items To Be Sold To Advance Current Rep Level")] public int ItemsRequired;
+            [JsonProperty("Bonus Percentage For This Rep Level")] public float Bonus;
+        }
+
+        private void UpdateReputation(ulong playerID, int itemsSold)
+        {
+            if (!_repData.TryGetValue(playerID, out var data))
+            {
+                data = new RepData {
+                    Level = 0,
+                    ItemsSold = 0
+                };
+                _repData[playerID] = data;
+            }
+            var max = _config.ReputationLevels.Keys.Max();
+            if (data.Level >= max)
+            {
+                return;
+            }
+            var i = data.Level;
+            data.ItemsSold += itemsSold;
+            foreach (var level in _config.ReputationLevels.OrderBy(l => l.Key))
+            {
+                if (level.Key <= data.Level)
+                    continue;
+                if (data.ItemsSold < level.Value.ItemsRequired)
+                    break;
+                data.ItemsSold -= level.Value.ItemsRequired;
+                data.Level = level.Key;
+            }
+            if (data.Level > i)
+            {
+                var player = BasePlayer.FindByID(playerID);
+                var percentage = GetBonusForPlayer(data) * 100;
+                var message = string.Format(lang.GetMessage("RepUp", this, player.UserIDString), data.Level, $"{percentage:0.##}%");
+                timer.Once(5f, () => ShowMiniToast(player, message));
+                SendLevelUp(player, data.Level);
+            }
+            SaveData();
+        }
+
+        private float GetBonusForPlayer(RepData data)
+        {
+            return _config.ReputationLevels.TryGetValue(data.Level, out var levelConfig) ? levelConfig.Bonus : 0f;
+        }
+
+        [ChatCommand("checkrep")]
+        private void CmdCheckRep(BasePlayer player, string command, string[] args)
+        {
+            if (!_config.EnableReputation)
+            {
+                return;
+            }
+            if (!_repData.TryGetValue(player.userID, out var data))
+            {
+                data = new RepData { Level = 0, ItemsSold = 0 };
+                _repData[player.userID] = data;
+            }
+            var i = data.Level;
+            var max = _config.ReputationLevels.Keys.Max();
+            var percentage = GetBonusForPlayer(data) * 100;
+            var key = i >= max ? "RepCheckMax" : "RepCheck";
+            var s = lang.GetMessage(key, this, player.UserIDString);
+            var message = string.Format(s, i, $"{percentage:0.##}%");
+            ShowMiniToast(player, message);
+        }
+
+        [ConsoleCommand("wiperep")]
+        private void CmdWipeRep(ConsoleSystem.Arg arg)
+        {
+            if (!arg.IsAdmin) return;
+            _repData.Clear();
+            for (var i = BasePlayer.activePlayerList.Count - 1; i >= 0; i--)
+            {
+                var player = BasePlayer.activePlayerList[i];
+                var id = player.userID;
+                if (_repData.TryGetValue(id, out var data)) continue;
+                data = new RepData {
+                    Level = 0,
+                    ItemsSold = 0
+                };
+                _repData[id] = data;
+            }
+            SaveData();
+            Puts("Wiped Reputation Data.");
+        }
+
+        #endregion
+
+        #region DynamicSpawn
+
+        private void SpawnDealer(BasePlayer player, Vector3 mPos, string name, Action retry = null)
+        {
+            for (var attempts = 0; attempts < 30; attempts++)
+            {
+                var dir = Random.onUnitSphere;
+                dir.y = 0;
+                dir.Normalize();
+                var randomize = Random.Range(25f, 100f);
+                var pos = mPos + dir * randomize;
+                pos.y = GetGroundPosition(pos);
+                var f = TerrainMeta.HeightMap.GetHeight(pos);
+                var surface = WaterLevel.GetWaterSurface(pos, false, false);
+                const float maxHeight = 10f;
+                if (pos.y < surface || pos.y - f > maxHeight) continue;
+                if (!IsValidSpawn(pos))
+                {
+                    //Puts("Spawn Position Invalid");
+                    continue;
+                }
+                var npc = GameManager.server.CreateEntity(Npc, pos) as NPCTalking;
+                if (npc == null) continue;
+                npc.loadouts = Array.Empty<PlayerInventoryProperties>();
+                _traderNpCs.Add(npc);
+                npc.Spawn();
+                Subscribe(nameof(CanBeTargeted));
+                npc.EnableSaving(wants: false);
+                if (!FinalChecks(npc))
+                {
+                    //Puts("Final Checks Failed");
+                    timer.Once(1f, () => ClearAndRetry(npc));
+                    continue;
+                }
+                _salecount.Add(player.userID, (npc, 0));
+                timer.Once(_config.WaitTime, () => CleanUpNpc(player.userID, npc));
+                SetupAttire(npc);
+                if (_config.MarkersEnabled)
+                {
+                    CreateMarker(npc, "The Dealer", 0, 3f, $"{player.displayName}'s Drop Off Location");
+                }
+                PingLocation(player, pos, _config.WaitTime, player.userID, BasePlayer.PingType.Dollar);
+                var grid = MapHelper.PositionToString(pos);
+                SendSuccess(player, name, grid, npc);
+                if (_config.LogCalls)
+                {
+                    SendBurnerUse(player, pos, name);
+                }
+                return;
+            }
+            timer.Once(0.1f, () => retry?.Invoke());
+        }
+
+        private bool IsValidSpawn(Vector3 pos)
+        {
+            var b = Physics.OverlapSphere(pos, 15, LayerMask.GetMask("World")).Length > 0;
+            var b1 = Physics.OverlapSphere(pos, 6f, LayerMask.GetMask("Default")).Length > 0;
+            var b2 = Physics.OverlapSphere(pos, 1f, LayerMask.GetMask("Default")).Length > 0;
+            var b3 = Physics.OverlapSphere(pos, 15f, LayerMask.GetMask("Construction")).Length > 0;
+            var testInsideTerrain = AntiHack.TestInsideTerrain(pos);
+            if (b || b1 || b2 || b3 || testInsideTerrain)
+            {
+                return false;
+            }
+            var colliders = Physics.OverlapSphere(pos, 15f, LayerMask.GetMask("Construction"));
+            foreach (var collider in colliders)
+            {
+                var priv = collider.GetComponentInParent<BuildingPrivlidge>();
+                if (priv != null)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private bool FinalChecks(NPCTalking npc)
+        {
+            var underground = npc.IsUnderground();
+            var underwater = npc.IsHeadUnderwater();
+            return !underground && !underwater;
+        }
+
+        private void SetupAttire(NPCTalking npc)
+        {
+            if (_config.NpcKitEnabled && !string.IsNullOrEmpty(_config.NpcKitName))
+            {
+                Kits?.Call("GiveKit", npc, _config.NpcKitName);
+            }
+            else
+            {
+                foreach (var option in _config.NpcClothingOptions)
+                {
+                    var itemDef = ItemManager.FindItemDefinition(option.Shortname);
+                    if (itemDef != null)
+                    {
+                        var item = ItemManager.Create(itemDef);
+                        if (option.Skin != 0)
+                        {
+                            item.skin = option.Skin;
+                            item.MarkDirty();
+                        }
+                        if (!item.MoveToContainer(npc.inventory.containerWear))
+                        {
+                            item.Remove();
+                        }
+                    }
+                    else
+                    {
+                        Puts($"[The Dealer] Failed to find clothing item definition: {option.Shortname}");
+                    }
+                }
+            }
+        }
+
+        //Used to Debug
+
+        /*[ChatCommand("R")]
+        private void RockcheckCmd(BasePlayer npc, string command, string[] args)
+        {
+            var b = Physics.OverlapSphere(npc.transform.position, 15, LayerMask.GetMask("World")).Length > 0;
+            var b1 = Physics.OverlapSphere(npc.transform.position, 6f, LayerMask.GetMask("Default")).Length > 0;
+            var b2 = Physics.OverlapSphere(npc.transform.position, 1f, LayerMask.GetMask("Default")).Length > 0;
+            var b3 = Physics.OverlapSphere(npc.transform.position, 15f, LayerMask.GetMask("Construction")).Length > 0;
+            var isUnderground = npc.IsUnderground();
+            var testInsideTerrain = AntiHack.TestInsideTerrain(npc.transform.position);
+            var isHeadUnderwater = npc.IsHeadUnderwater();
+            if (b)
+            {
+                Puts("Detected World");
+            }
+            else if (b1)
+            {
+                Puts("Detected");
+            }
+            else if (b2)
+            {
+                Puts("Detected");
+            }
+            else if (b3)
+            {
+                Puts("Detected");
+            }
+            else if (isUnderground)
+            {
+                Puts("Detected");
+            }
+            else if (testInsideTerrain)
+            {
+                Puts("Detected");
+            }
+            else if (isHeadUnderwater)
+            {
+                Puts("Detected");
+            }
+            /*"{{user_id_encoded}}"
+            "{{current_time}}"
+            "{{author_name}}"* /
+            var colliders = Physics.OverlapSphere(npc.transform.position, 15f, LayerMask.GetMask("Construction"));
+            foreach (var collider in colliders)
+            {
+                var priv = collider.GetComponentInParent<BuildingPrivlidge>();
+                if (priv != null)
+                {
+                    Puts("priv");
+                }
+            }
+            Puts("Clear Spawn");
+            SendSphere(npc, 5, npc.transform.position, Color.green);
+        }
+
+        private static void SendSphere(BasePlayer player, float time, Vector3 pos, Color color)
+        {
+            player.SendConsoleCommand("ddraw.sphere", time, color, pos + new Vector3(0f, 2f, 0f), 20);
+        }*/
+
+        private void ClearAndRetry(NPCTalking npc)
+        {
+            npc?.Kill();
+            _traderNpCs.Remove(npc);
+        }
+
+        private void PingLocation(BasePlayer player, Vector3 location, float time, ulong associatedId, BasePlayer.PingType pingType)
+        {
+            player.AddPingAtLocation(pingType, location, time, new NetworkableId(associatedId));
+        }
+
+        #endregion
+
+        #region Marker
+
+        private void CreateMarker(BaseEntity entity, string markerId = "The Dealer", int duration = 0, float refreshRate = 3f, string displayName = "")
+        {
+            var colorMarker = _config.MarkerSettings.DealerColor;
+            var colorOutline = _config.MarkerSettings.DealerOutline;
+            var alpha = _config.MarkerSettings.DealerAlpha;
+            var radius = _config.MarkerSettings.DealerRadius;
+            Interface.CallHook("API_CreateMarker", entity, markerId, duration, refreshRate, radius, displayName, colorMarker, colorOutline, alpha);
+        }
+
+        #endregion
+
+        #region Discord
+
+        private void SendLevelUp(BasePlayer player, int newLevel)
+        {
+            var s = $"{player.displayName} has reached Reputation Level {newLevel}!";
+            LogDiscord(_url, "The Dealer", s, DealerGif);
+        }
+
+        private void SendTop(string message)
+        {
+            var s = JsonConvert.SerializeObject(message).Trim('"');
+            LogDiscord(_topWebhook, "", s, DealerGif);
+        }
+
+        private void SendBurnerUse(BasePlayer player, Vector3 pos, string loc)
+        {
+            var s = $"{player.displayName} just called up a potential buyer near {loc}, in grid {MapHelper.PositionToString(pos)}.";
+            LogDiscord(_url, "The Dealer", s, DealerGif);
+        }
+
+        private void SendTrade(BasePlayer player, string itemName, int quantity, int total, string title, string image, bool inDemand)
+        {
+            var currency = GetCurrencyName();
+            var s = _config.CustomCurrencyEnabled ? $"{player.displayName} sold {quantity}x {itemName}(s) for {total}x {currency}." : $"{player.displayName} sold {quantity}x {itemName}(s) for {currency}{total}.";
+            if (inDemand)
+            {
+                s += " This item is currently in demand!";
+            }
+            LogDiscord(_url, title, s, image);
+        }
+
+        private void LogDiscord(string url, string title, string s, string gif)
+        {
+            if (string.IsNullOrEmpty(url))
+            {
+                return;
+            }
+            var color = "16750950";
+            if (gif == DrugsGif)
+            {
+                color = "3800844";
+            }
+            var content = Json.Replace("{title}", title).Replace("{description}", s).Replace("{imageUrl}", gif).Replace("{color}", color);
+            webrequest.Enqueue(url, content, (code, response) =>
+            {
+                if (code != 204)
+                    Puts($"Discord responded with code {code}. Response: {response}");
+            }, this, RequestMethod.POST, new Dictionary<string, string> {
+                ["Content-Type"] = "application/json"
+            });
+        }
+
+        private const string Json = @"{
+    ""embeds"": [
+        {
+            ""type"": ""rich"",
+            ""title"": ""{title}"",
+            ""description"": ""{description}"",
+            ""color"": ""{color}"",
+            ""thumbnail"": {
+                ""url"": ""{imageUrl}"",
+                ""proxy_url"": ""{imageUrl}"",
+                ""height"": 64,
+                ""width"": 64
+            }
+        }
+    ]
+}";
+
+        #endregion
+
+        #region BurnerLogic
+
+        private object OnItemAction(Item item, string action, BasePlayer player)
+        {
+            if (player == null)
+                return null;
+            switch (action)
+            {
+                case "upgrade_item" when item.skin == _config.BurnerSkin:
+                    return true;
+                case "unwrap" when item.skin == _config.BurnerSkin:
+                    if (!_fullyLoaded)
+                    {
+                        Puts("Plugin is Initializing.");
+                        return true;
+                    }
+                    if (!permission.UserHasPermission(player.UserIDString, _config.UsePermissionName))
+                    {
+                        SendEffect(player, DeniedFx);
+                        return true;
+                    }
+                    if (!ServerRewards && !Economics && !_config.CustomCurrencyEnabled)
+                    {
+                        Puts("Server Rewards or Economics are not loaded.");
+                        return true;
+                    }
+                    if (_burnerCooldown.Contains(player))
+                    {
+                        SendEffect(player, DeniedFx);
+                        return true;
+                    }
+                    if (_callerDealerPair.TryGetValue(player.userID, out _))
+                    {
+                        InRoute(player.userID);
+                        return true;
+                    }
+                    var id = player.userID;
+                    if (!_repData.TryGetValue(id, out var data))
+                    {
+                        data = new RepData {
+                            Level = 0,
+                            ItemsSold = 0
+                        };
+                        _repData[id] = data;
+                    }
+                    SendEffect(player, PhoneFx);
+                    CallDealer(player.userID);
+                    SetupCooldown(player);
+                    item.UseItem();
+                    return true;
+                default:
+                    return null;
+            }
+        }
+
+        private void SetupCooldown(BasePlayer player)
+        {
+            _burnerCooldown.Add(player);
+            timer.Once(10f, () => _burnerCooldown.Remove(player));
+        }
+
+        private void InRoute(ulong id)
+        {
+            var player = BasePlayer.FindAwakeOrSleepingByID(id);
+            var monumentName = _monumentName.GetValueOrDefault(id).monumentName;
+            var displayName = _monumentDisplayNames.GetValueOrDefault(monumentName, monumentName);
+            var grid = _monumentName.GetValueOrDefault(id).grid;
+            var messageTemplate = lang.GetMessage("InRoute", this, player.UserIDString);
+            var tweak = messageTemplate.Replace("[<color=#ef6500>The Dealer</color>]", ""); //Removing for now, shipped other versions before i moved this key to toast.
+            var message = string.Format(tweak, displayName, grid);
+            ShowMiniToast(player, message);
+        }
+
+        private void CallDealer(ulong id)
+        {
+            var player = BasePlayer.FindAwakeOrSleepingByID(id);
+            var (spawnPosition, monumentName) = ChooseSpawnPos();
+            var displayName = _monumentDisplayNames.GetValueOrDefault(monumentName, monumentName);
+            var grid = MapHelper.PositionToString(spawnPosition);
+            _monumentName.Add(id, (npc: null, monumentName, grid));
+            AttemptSpawn(player, spawnPosition, displayName);
+        }
+
+        private void AttemptSpawn(BasePlayer player, Vector3 spawnPosition, string displayName, int retryCount = 0)
+        {
+            if (retryCount > 10)
+            {
+                Refund(player);
+                CleanUpNpc(player.userID, null);
+                return;
+            }
+            SpawnDealer(player, spawnPosition, displayName, () => { timer.Once(2f, () => { TrySpawn(player, retryCount); }); });
+
+        }
+
+        private void TrySpawn(BasePlayer player, int retryCount)
+        {
+            var (position, monumentName) = ChooseSpawnPos();
+            var newDisplayName = _monumentDisplayNames.GetValueOrDefault(monumentName, monumentName);
+            AttemptSpawn(player, position, newDisplayName, retryCount + 1);
+        }
+
+        private void SendSuccess(BasePlayer player, string displayName, string grid, NPCTalking dealer)
+        {
+            _callerDealerPair[player.userID] = dealer;
+            _monumentName[player.userID] = (dealer, displayName, grid);
+            var format = lang.GetMessage("MeetupMessage", this, player.UserIDString);
+            var message = string.Format(format, displayName, grid);
+            ShowMiniToast(player, message);
+            TryPolice();
+            timer.Repeat(1f, 2, () => SendEffect(player, Vibrate));
+        }
+
+        private void TryPolice()
+        {
+            if (Random.Range(0, 100) < _config.PoliceChance)
+            {
+                NotifyPolice();
+            }
+        }
+
+        private void Refund(BasePlayer player)
+        {
+            ShowMiniToast(player, "No answer...");
+            var item = ItemManager.CreateByName("xmas.present.small", 1, _config.BurnerSkin);
+            item.name = "Burner Phone";
+            player.GiveItem(item);
+        }
+
+        private void ShowMiniToast(BasePlayer player, string text)
+        {
+            DestroyAllUi(player);
+            DestroyTimers(player);
+            SendEffect(player, NoticeFx);
+            UIBase(player, text);
+            FadeUi(player);
+        }
+
+        private void UIBase(BasePlayer player, string text)
+        {
+            var container = new CuiElementContainer {
+                new CuiElement {
+                    Name = "MiniToast",
+                    Parent = "Under",
+                    DestroyUi = "MiniToast",
+                    Components = {
+                        new CuiImageComponent {
+                            Color = "0.1792453 0.1792453 0.1792453 0",
+                            FadeIn = 1,
+                            Material = "assets/content/ui/uibackgroundblur-notice.mat"
+                        },
+                        new CuiRectTransformComponent {
+                            AnchorMin = "0.4 0.9",
+                            AnchorMax = "0.6 1",
+                            OffsetMin = "-640 -720",
+                            OffsetMax = "640 0"
+                        }
+                    }
+                },
+                new CuiElement {
+                    Name = "MiniToastImage",
+                    Parent = "MiniToast",
+                    FadeOut = 1,
+                    Components = {
+                        new CuiRawImageComponent() {
+                            Color = "1 1 1 1",
+                            FadeIn = 1,
+                            Png = ImageLibrary?.Call<string>("GetImage", _config.MiniToastImage)
+                        },
+                        new CuiRectTransformComponent {
+                            AnchorMin = "0.5 1",
+                            AnchorMax = "0.5 1",
+                            OffsetMin = "-170 -230",
+                            OffsetMax = "170 100"
+                        }
+                    }
+                },
+                new CuiElement {
+                    Name = "MiniToastText",
+                    Parent = "MiniToast",
+                    FadeOut = 1,
+                    Components = {
+                        new CuiTextComponent {
+                            Text = $"{text}",
+                            Font = "permanentmarker.ttf",
+                            FontSize = 12,
+                            Align = TextAnchor.MiddleCenter,
+                            Color = "0.937255 0.3960785 0 1",
+                            FadeIn = 1
+                        },
+                        new CuiRectTransformComponent {
+                            AnchorMin = "0.5 1.0202",
+                            AnchorMax = "0.5 1",
+                            OffsetMin = "-138.71 -142.073",
+                            OffsetMax = "139.71 16.073"
+                        }
+                    }
+                }
+            };
+            CuiHelper.AddUi(player, container);
+        }
+
+        private void FadeUi(BasePlayer player)
+        {
+            _timer1[player] = timer.Once(5f, () => { CuiHelper.DestroyUi(player, "MiniToastText"); });
+            _timer2[player] = timer.Once(5.5f, () => { CuiHelper.DestroyUi(player, "MiniToastImage"); });
+            _timer3[player] = timer.Once(6.5f, () => { CuiHelper.DestroyUi(player, "MiniToastPanel"); });
+        }
+
+        private void DestroyTimers(BasePlayer player)
+        {
+            if (_timer1.TryGetValue(player, out var value))
+            {
+                value.Destroy();
+            }
+            if (_timer2.TryGetValue(player, out var value1))
+            {
+                value1.Destroy();
+            }
+            if (_timer3.TryGetValue(player, out var value2))
+            {
+                value2.Destroy();
+            }
+        }
+
+        private void DestroyAllUi(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, "MiniToastPanel");
+            CuiHelper.DestroyUi(player, "MiniToastImage");
+            CuiHelper.DestroyUi(player, "MiniToastText");
+            CuiHelper.DestroyUi(player, "TopSalesPanel");
+        }
+
+        [ChatCommand("giveburner")]
+        private void GiveBurner(BasePlayer player, string command, string[] args)
+        {
+            if (!player.IsAdmin) return;
+            GetBurner(out var item, 100);
+            player.GiveItem(item);
+            ShowMiniToast(player, "Burner Delivered");
+        }
+
+        private void GetBurner(out Item item, int amount)
+        {
+            item = ItemManager.CreateByName("xmas.present.small", amount, _config.BurnerSkin);
+            if (item == null) return;
+            item.name = "Burner Phone";
+        }
+
+        [ChatCommand("givedealerloot")]
+        private void CmdGiveDealerLoot(BasePlayer player, string command, string[] args)
+        {
+            if (!player.IsAdmin)
+            {
+                return;
+            }
+            foreach (var items in _config.TradeableItemsList)
+            {
+                var item = ItemManager.CreateByName(items.ShortName, 100000, items.SkinID);
+                if (item == null) continue;
+                item.name = items.CustomName;
+                player.GiveItem(item);
+            }
+        }
+
+        [ChatCommand("where")]
+        private void WhereCommand(BasePlayer player, string command, string[] args)
+        {
+            if (_callerDealerPair.TryGetValue(player.userID, out var npc))
+            {
+                InRoute(player.userID);
+                PingLocation(player, npc.transform.localPosition, _config.WaitTime, player.userID, BasePlayer.PingType.Dollar);
+            }
+            else
+            {
+                NoRoute(player);
+            }
+        }
+
+        private void NoRoute(BasePlayer player)
+        {
+            var message = lang.GetMessage("NoRoute", this, player.UserIDString);
+            var s = message.Replace("[<color=#ef6500>The Dealer</color>]", ""); //Removing for now, shipped other versions before i moved this key to toast.
+            ShowMiniToast(player, s);
+        }
+
+        #endregion
+
+        #region MonumentLogic
+
+        private float GetGroundPosition(Vector3 pos)
+        {
+            var y = TerrainMeta.HeightMap.GetHeight(pos);
+            return Physics.Raycast(new Vector3(pos.x, pos.y, pos.z), Vector3.down, out var hit, Mathf.Infinity, LayerMask.GetMask("Terrain")) ? Mathf.Max(hit.point.y, y) : y;
+        }
+
+        private (Vector3 position, string monumentName) ChooseSpawnPos()
+        {
+            var list = Pool.Get<List<(Vector3 position, string monumentName)>>();
+            try
+            {
+                foreach (var monument in _monumentInfo)
+                {
+                    if (monument != null)
+                    {
+                        list.Add((monument.transform.position, monument.name));
+                    }
+                }
+                list.Shuffle();
+                return list.Count == 0 ? (Vector3.zero, string.Empty) : list[0];
+            }
+            finally
+            {
+                Pool.FreeUnmanaged(ref list); //CHECK POOL LATER
+            }
+        }
+
+        // Excluding some Trouble Monuments.
+        private void LoadMonumentInfo()
+        {
+            var monuments = TerrainMeta.Path.Monuments;
+            var count = 0;
+            foreach (var monument in monuments)
+            {
+                if (monument == null)
+                    continue;
+                var prefab = monument.name;
+                if (!_monumentDisplayNames.ContainsKey(prefab))
+                    continue;
+                _monumentInfo.Add(monument);
+                count++;
+            }
+            Puts($"Found {count} Possible Monuments to Utilize.");
+        }
+
+        #endregion
+
+        #region NPCCleanup
+
+        private void CleanUpNpc(ulong id, NPCTalking npc)
+        {
+            CheckCount(id);
+            var player = BasePlayer.FindAwakeOrSleepingByID(id);
+            if (player == null || !player.IsConnected)
+            {
+                _salecount.Remove(id);
+                _monumentName.Remove(id);
+                _callerDealerPair.Remove(id);
+
+                if (npc != null && !npc.IsDestroyed)
+                {
+                    npc.Kill();
+                }
+                _traderNpCs.Remove(npc);
+                if (_traderNpCs.Count == 0)
+                {
+                    Unsubscribe(nameof(CanBeTargeted));
+                }
+                return;
+            }
+            FinalizeExit(id, npc);
+        }
+
+        private void FinalizeExit(ulong id, NPCTalking npc)
+        {
+            var plist = Pool.Get<List<KeyValuePair<ulong, NPCTalking>>>();
+            plist.AddRange(_callerDealerPair);
+            foreach (var pair in plist)
+            {
+                if (pair.Value != npc) continue;
+                _callerDealerPair.Remove(pair.Key);
+                break;
+            }
+            Pool.FreeUnmanaged(ref plist);
+            _salecount.Remove(id);
+            _monumentName.Remove(id);
+            if (npc != null && !npc.IsDestroyed)
+            {
+                npc.Kill();
+            }
+            _traderNpCs.Remove(npc);
+            if (_traderNpCs.Count == 0)
+            {
+                Unsubscribe(nameof(CanBeTargeted));
+            }
+        }
+
+        private void CheckCount(ulong id)
+        {
+            if (!_salecount.TryGetValue(id, out var saleInfo)) return;
+            if (_config.EnableReputation && saleInfo.saleCount > 0)
+            {
+                UpdateReputation(id, saleInfo.saleCount);
+            }
+            if (saleInfo.saleCount > 0)
+            {
+                UpdateSaleScore(id, saleInfo.saleCount);
+            }
+            var player = BasePlayer.FindAwakeOrSleepingByID(id);
+            if (player == null) return;
+            var message = saleInfo.saleCount > 0 ? SendThanks(player, player.displayName) : SendAngry(player, player.displayName);
+            ShowMiniToast(player, message);
+            timer.Repeat(1f, 2, () => { SendEffect(player, Vibrate); });
+        }
+
+        private void UpdateSaleScore(ulong id, int saleInfoSaleCount)
+        {
+            if (_saleScore.TryGetValue(id, out var score))
+            {
+                _saleScore[id] = score + saleInfoSaleCount;
+            }
+            else
+            {
+                _saleScore[id] = saleInfoSaleCount;
+            }
+            SaveData();
+            UpdateKingpin();
+        }
+
+        private void UpdateKingpin()
+        {
+            if (!_config.EnableKingpin)
+            {
+                return;
+            }
+            if (!permission.GroupExists(_config.KingpinGroup))
+            {
+                permission.CreateGroup(_config.KingpinGroup, _config.KingpinGroup, 0);
+            }
+            ulong newKingpin = 0;
+            var highestScore = -1;
+            foreach (var kv in _saleScore)
+            {
+                if (kv.Value > highestScore)
+                {
+                    highestScore = kv.Value;
+                    newKingpin = kv.Key;
+                }
+            }
+            if (highestScore < _config.KingpinMin)
+            {
+                RevokeCurrentKingpin();
+                return;
+            }
+            if (newKingpin == 0) return;
+            var newPlayer = BasePlayer.FindAwakeOrSleepingByID(newKingpin);
+            if (newPlayer == null) return;
+            if (permission.UserHasGroup(newPlayer.UserIDString, _config.KingpinGroup))
+            {
+                return;
+            }
+            RevokeCurrentKingpin();
+            permission.AddUserGroup(newPlayer.UserIDString, _config.KingpinGroup);
+            var gainedMessage = string.Format(lang.GetMessage("KingpinGained", this, newPlayer.UserIDString), newPlayer.displayName);
+            Server.Broadcast(gainedMessage);
+            if (_config.TopRanksToDiscord)
+            {
+                SendTop($"Kingpin Status\n\nThe new Kingpin is {newPlayer.displayName}");
+            }
+        }
+
+        private void RevokeCurrentKingpin()
+        {
+            ulong previousKingpin = 0;
+            foreach (var kv in _saleScore)
+            {
+                if (permission.UserHasGroup(kv.Key.ToString(), _config.KingpinGroup))
+                {
+                    previousKingpin = kv.Key;
+                    break;
+                }
+            }
+            if (previousKingpin == 0) return;
+            var oldPlayer = BasePlayer.FindAwakeOrSleepingByID(previousKingpin);
+            if (oldPlayer != null && oldPlayer.IsConnected)
+            {
+                var s = lang.GetMessage("KingpinLost", this, oldPlayer.UserIDString);
+                Player.Message(oldPlayer, string.Format(s));
+            }
+            permission.RemoveUserGroup(previousKingpin.ToString(), _config.KingpinGroup);
+            if (_config.TopRanksToDiscord)
+            {
+                SendTop($"Kingpin Status\n\n{oldPlayer.displayName} is no longer the Kingpin");
+            }
+        }
+
+        private string SendAngry(BasePlayer player, string name)
+        {
+            var message = lang.GetMessage("WasteTimeMessage", this, player.UserIDString);
+            var s = string.Format(message, name);
+            return s;
+        }
+
+        private string SendThanks(BasePlayer player, string name)
+        {
+            var message = lang.GetMessage("BusinessMessage", this, player.UserIDString);
+            var s = string.Format(message, name);
+            return s;
+        }
+
+        #endregion
+
+        #region MonumentMapping
+
+        private readonly Dictionary<string, string> _monumentDisplayNames = new() {
+            { "assets/bundled/prefabs/autospawn/monument/arctic_bases/arctic_research_base_a.prefab", "Arctic Research Base" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_large_hard.prefab", "Large Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_large_medium.prefab", "Medium Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_large_sewers_hard.prefab", "Large Sewers Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_medium_easy.prefab", "Medium Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_medium_hard.prefab", "Hard Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_medium_medium.prefab", "Medium Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_small_easy.prefab", "Small Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_small_hard.prefab", "Small Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/cave/cave_small_medium.prefab", "Small Cave" },
+            { "assets/bundled/prefabs/autospawn/monument/fishing_village/fishing_village_a.prefab", "Fishing Village" },
+            { "assets/bundled/prefabs/autospawn/monument/fishing_village/fishing_village_b.prefab", "Fishing Village" },
+            { "assets/bundled/prefabs/autospawn/monument/fishing_village/fishing_village_c.prefab", "Fishing Village" },
+            { "assets/bundled/prefabs/autospawn/monument/harbor/ferry_terminal_1.prefab", "Ferry Terminal" },
+            { "assets/bundled/prefabs/autospawn/monument/harbor/harbor_1.prefab", "Harbor" },
+            { "assets/bundled/prefabs/autospawn/monument/harbor/harbor_2.prefab", "Harbor" },
+            { "assets/bundled/prefabs/autospawn/monument/large/airfield_1.prefab", "Airfield" },
+            { "assets/bundled/prefabs/autospawn/monument/large/excavator_1.prefab", "Excavator" },
+            { "assets/bundled/prefabs/autospawn/monument/large/military_tunnel_1.prefab", "Military Tunnel" },
+            { "assets/bundled/prefabs/autospawn/monument/large/powerplant_1.prefab", "Power Plant" },
+            { "assets/bundled/prefabs/autospawn/monument/large/trainyard_1.prefab", "Trainyard" },
+            { "assets/bundled/prefabs/autospawn/monument/large/water_treatment_plant_1.prefab", "Water Treatment" },
+            { "assets/bundled/prefabs/autospawn/monument/lighthouse/lighthouse.prefab", "Lighthouse" },
+            { "assets/bundled/prefabs/autospawn/monument/medium/bandit_town.prefab", "Bandit Camp" },
+            { "assets/bundled/prefabs/autospawn/monument/medium/compound.prefab", "Outpost" },
+            { "assets/bundled/prefabs/autospawn/monument/medium/junkyard_1.prefab", "Junkyard" },
+            { "assets/bundled/prefabs/autospawn/monument/medium/nuclear_missile_silo.prefab", "Missile Silo" },
+            { "assets/bundled/prefabs/autospawn/monument/medium/radtown_small_3.prefab", "Small Rad Town" },
+            { "assets/bundled/prefabs/autospawn/monument/roadside/radtown_1.prefab", "Rad Town" },
+            { "assets/bundled/prefabs/autospawn/monument/military_bases/desert_military_base_a.prefab", "Abandoned Military Base" },
+            { "assets/bundled/prefabs/autospawn/monument/military_bases/desert_military_base_b.prefab", "Abandoned Military Base" },
+            { "assets/bundled/prefabs/autospawn/monument/military_bases/desert_military_base_c.prefab", "Abandoned Military Base" },
+            { "assets/bundled/prefabs/autospawn/monument/military_bases/desert_military_base_d.prefab", "Abandoned Military Base" },
+            { "assets/bundled/prefabs/autospawn/monument/roadside/gas_station_1.prefab", "Gas Station" },
+            { "assets/bundled/prefabs/autospawn/monument/roadside/supermarket_1.prefab", "Supermarket" },
+            { "assets/bundled/prefabs/autospawn/monument/roadside/warehouse.prefab", "Mining Outpost" },
+            { "assets/bundled/prefabs/autospawn/monument/small/mining_quarry_a.prefab", "Mining Quarry" },
+            { "assets/bundled/prefabs/autospawn/monument/small/mining_quarry_b.prefab", "Mining Quarry" },
+            { "assets/bundled/prefabs/autospawn/monument/small/mining_quarry_c.prefab", "Mining Quarry" },
+            { "assets/bundled/prefabs/autospawn/monument/small/satellite_dish.prefab", "Satellite Dish" },
+            { "assets/bundled/prefabs/autospawn/monument/small/stables_a.prefab", "Stables" },
+            { "assets/bundled/prefabs/autospawn/monument/small/stables_b.prefab", "Stables" },
+            { "assets/bundled/prefabs/autospawn/monument/swamp/swamp_a.prefab", "Swamp" },
+            { "assets/bundled/prefabs/autospawn/monument/swamp/swamp_b.prefab", "Swamp" },
+            { "assets/bundled/prefabs/autospawn/monument/swamp/swamp_c.prefab", "Swamp" },
+            { "assets/bundled/prefabs/autospawn/monument/tiny/water_well_a.prefab", "Water Well" },
+            { "assets/bundled/prefabs/autospawn/monument/tiny/water_well_b.prefab", "Water Well" },
+            { "assets/bundled/prefabs/autospawn/monument/tiny/water_well_c.prefab", "Water Well" },
+            { "assets/bundled/prefabs/autospawn/monument/tiny/water_well_d.prefab", "Water Well" },
+            { "assets/bundled/prefabs/autospawn/monument/tiny/water_well_e.prefab", "Water Well" },
+            { "assets/bundled/prefabs/autospawn/power substations/big/power_sub_big_1.prefab", "Power Sub" },
+            { "assets/bundled/prefabs/autospawn/power substations/big/power_sub_big_2.prefab", "Power Sub" },
+            { "assets/bundled/prefabs/autospawn/power substations/small/power_sub_small_1.prefab", "Power Sub" },
+            { "assets/bundled/prefabs/autospawn/power substations/small/power_sub_small_2.prefab", "Power Sub" },
+            { "assets/bundled/prefabs/autospawn/tunnel-entrance/entrance_bunker_a.prefab", "Bunker" },
+            { "assets/bundled/prefabs/autospawn/tunnel-entrance/entrance_bunker_b.prefab", "Bunker" },
+            { "assets/bundled/prefabs/autospawn/tunnel-entrance/entrance_bunker_c.prefab", "Bunker" },
+            { "assets/bundled/prefabs/autospawn/tunnel-entrance/entrance_bunker_d.prefab", "Bunker" },
+        };
+
+        #endregion
+
+        #region LawEnforcement
+
+        private void NotifyPolice()
+        {
+            //Puts("Police Called");
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (!permission.UserHasPermission(player.UserIDString, LeoPermission)) continue;
+                timer.Repeat(2, 3, () => SendEffect(player, Vibrate));
+                NotifyCops(player);
+            }
+        }
+
+        private void NotifyCops(BasePlayer player)
+        {
+            var s = lang.GetMessage("NotifyCops", this, player.UserIDString);
+            Player.Message(player, string.Format(s), null, _config.ChatIcon);
+        }
+
+        #endregion
+
+        #region FX
+
+        private static void SendEffect(BasePlayer player, string s)
+        {
+            if (string.IsNullOrEmpty(s)) return;
+            var pos = player.transform.position;
+            EffectNetwork.Send(new Effect(s, pos, pos), player.net.connection);
+        }
+
+        #endregion
+
+        #region UI
+
+        [ChatCommand("topdealers")]
+        private void CmdTopSales(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, "TopSalesPanel");
+            var container = new CuiElementContainer {
+                {
+                    new CuiPanel {
+                        RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                        Image = { Color = "0 0 0 0.99" }, CursorEnabled = true
+                    },
+                    "Overlay", "TopSalesPanel", "TopSalesPanel"
+                }
+            };
+            var text = GetTopSales();
+            if (string.IsNullOrEmpty(text))
+            {
+                text = "<size=16><color=#ef6500>No Dealer Info Available</color></size>";
+            }
+            container.Add(new CuiLabel() {
+                Text = { Text = text, FontSize = 26, Align = TextAnchor.MiddleCenter },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1", OffsetMax = "0 0", OffsetMin = "0 0" }
+            }, "TopSalesPanel");
+            container.Add(new CuiButton {
+                FadeOut = 1,
+                Button = {
+                    Color = "1 0 0 1", FadeIn = 1, Sprite = "assets/icons/close.png", Command = "DestroyTopSalesPanel"
+                },
+                RectTransform = {
+                    AnchorMin = "0.02 0.96",
+                    AnchorMax = "0.02 0.96",
+                    OffsetMin = "-10 -10",
+                    OffsetMax = "10 10"
+                }
+            }, "TopSalesPanel", "CloseButton");
+            CuiHelper.AddUi(player, container);
+        }
+
+        private void AnnounceTopDealers()
+        {
+            if (_config.TopRanksToDiscord)
+            {
+                var s = GetTopSales();
+                if (!string.IsNullOrEmpty(s))
+                {
+                    SendTop(RemoveTags(s));
+                }
+            }
+            if (!_config.TopRanksToChat) return;
+            {
+                var s = GetTopSales(true);
+                if (!string.IsNullOrEmpty(s))
+                {
+                    Server.Broadcast(s);
+                }
+            }
+        }
+
+        private string GetTopSales(bool chat = false)
+        {
+            List<KeyValuePair<ulong, int>> list = null;
+            try
+            {
+                var counts = _saleScore.OrderByDescending(kv => kv.Value).Take(10);
+                list = Pool.Get<List<KeyValuePair<ulong, int>>>();
+                list.AddRange(counts);
+                if (!list.Any() || list.All(kv => kv.Value == 0))
+                    return null;
+                var i = chat ? 20 : 42;
+                var size = chat ? 16 : 30;
+                var titleSize = chat ? 16 : 28;
+                var s = $"<size={i}><color=#ef6500>Top Dealers</color></size>\n\n";
+                var first = true;
+                var count = 0;
+                foreach (var kv in list)
+                {
+                    var player = covalence.Players.FindPlayer(kv.Key.ToString());
+                    var name = player?.Name ?? "Unknown";
+                    var kingpin = permission.UserHasGroup(kv.Key.ToString(), _config.KingpinGroup);
+                    if (first)
+                    {
+                        var title = kingpin ? "<color=#ef0013>Kingpin</color>" : "<color=#ffcc00>Top Dog</color>";
+                        s += $"<size={size}>{title}</size>\n\n";
+                        s += $"<color=#00efdd>{name}</color> with <color=#008aef>{kv.Value}</color> <color=#00ef65>Dealer Score</color>\n\n";
+                        first = false;
+                    }
+                    else
+                    {
+                        if (count == 0)
+                            s += $"<size={titleSize}><color=#008bef>Dealer</color></size>\n\n";
+                        s += $"<color=#00efdd>{name}</color> with <color=#008aef>{kv.Value}</color> <color=#00ef65>Dealer Score</color>\n";
+                        count++;
+                    }
+                }
+                return s;
+            }
+            finally
+            {
+                Pool.FreeUnmanaged(ref list);
+            }
+        }
+
+        [ConsoleCommand("DestroyTopSalesPanel")]
+        private void DestroyTopSalesPanel(ConsoleSystem.Arg arg)
+        {
+            CuiHelper.DestroyUi(arg.Player(), "TopSalesPanel");
+        }
+
+        [ConsoleCommand("WipeSaleData")]
+        private void WipeSaleData(ConsoleSystem.Arg arg)
+        {
+            if (!arg.IsAdmin) return;
+            RemoveFromGroup();
+            _saleScore.Clear();
+            SaveData();
+            Puts("Top Sales Wiped.");
+        }
+
+        #endregion
+
+        #region InDemandItems
+
+        private class InDemandItemSetup
+        {
+            [JsonProperty("Max In Demand Items")] public int MaxInDemandItems;
+            [JsonProperty("Min In Demand Multiplier (USE INTS FOR CUSTOM CURRENCY 1,2,3 ETC.)")] public float MinMultiplier;
+            [JsonProperty("Max In Demand Multiplier (USE INTS FOR CUSTOM CURRENCY 1,2,3 ETC.)")] public float MaxMultiplier;
+            [JsonProperty("In Demand Item Cycle Time In Minutes")] public int CycleTime;
+        }
+
+        private readonly Dictionary<ulong, float> _inDemandItems = new();
+
+        private void RollInDemandItems()
+        {
+            _inDemandItems.Clear();
+            var list = Pool.Get<List<ulong>>();
+            foreach (var item in _config.TradeableItemsList)
+            {
+                if (string.IsNullOrEmpty(item.CustomName))
+                {
+                    continue;
+                }
+                if (item.SkinID == 0)
+                {
+                    continue;
+                }
+                list.Add(item.SkinID);
+            }
+            if (Drugs)
+            {
+                if ((bool)Interface.CallHook("DealerIntegration"))
+                {
+                    foreach (var drug in _drugList)
+                    {
+                        if (drug == null) continue;
+                        if (!drug.TryGetValue("Skin", out var value)) continue;
+                        var skinId = Convert.ToUInt64(value);
+                        if (skinId == _config.BurnerSkin) continue;
+                        var marketable = (bool?)Interface.CallHook("IsMarketableDrug", skinId);
+                        var name = (string)Interface.CallHook("GetDrugName", skinId);
+                        if (string.IsNullOrEmpty(name))
+                        {
+                            continue;
+                        }
+                        if (marketable != true)
+                        {
+                            continue;
+                        }
+                        if (!list.Contains(skinId))
+                        {
+                            list.Add(skinId);
+                        }
+                    }
+                }
+            }
+            if (list.Count == 0) return;
+            var total = Random.Range(1, _config.InDemandItemSetup.MaxInDemandItems + 1);
+            total = Math.Min(total, list.Count);
+            list.Shuffle();
+            for (var i = 0; i < total; i++)
+            {
+                var id = list[i];
+                var multi = Random.Range(_config.InDemandItemSetup.MinMultiplier, _config.InDemandItemSetup.MaxMultiplier);
+                _inDemandItems[id] = multi;
+            }
+            Pool.FreeUnmanaged(ref list);
+            InDemand(null, null, null);
+            Puts($"Refreshed In Demand List with {total} new items.");
+        }
+
+        [ChatCommand("InDemand")]
+        private void InDemand(BasePlayer player, string command, string[] args)
+        {
+            if (_inDemandItems.Count == 0)
+            {
+                if (player)
+                {
+                    player.ChatMessage("No In Demand Items");
+                }
+                return;
+            }
+            var s = "<size=20><color=#ef6500>In Demand Dealer Items</color></size>\n\n";
+            foreach (var kv in _inDemandItems)
+            {
+                var found = false;
+                foreach (var item in _config.TradeableItemsList)
+                {
+                    if (item.SkinID != kv.Key) continue;
+                    s += $"<color=#ef6500>{item.CustomName}</color> with a <color=#008aef>{kv.Value * 100:F0}%</color> <color=#ef6500>Bonus</color>\n";
+                    found = true;
+                    break;
+                }
+                if (found) continue;
+                var name = (string)Interface.CallHook("GetDrugName", kv.Key);
+                if (!string.IsNullOrEmpty(name))
+                {
+                    s += $"<color=green>{name}</color> with a <color=#008aef>{kv.Value * 100:F0}%</color> <color=green>Bonus</color>\n";
+                }
+            }
+            if (player)
+            {
+                player.ChatMessage(s);
+            }
+            else
+            {
+                Server.Broadcast(s);
+            }
+        }
+
+        #endregion
+    }
+}
